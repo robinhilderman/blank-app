@@ -1,1 +1,10 @@
 streamlit
+plotly
+numpy
+matplotlib
+python_ags4
+python_ags4.data
+glob
+pandas
+os
+tkinter
