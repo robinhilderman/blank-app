@@ -27,6 +27,7 @@ from langchain_community.embeddings import AzureOpenAIEmbeddings
 
 # text_splitter
 from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_text_splitters import CharacterTextSplitter
 
 #Vector store
 import tkinter as tk
@@ -55,6 +56,13 @@ from langchain_openai import ChatOpenAI, OpenAIEmbeddings, AzureChatOpenAI
 
  #?
 from langchain_core.documents import Document
+
+from langchain_core.messages import get_buffer_string
+
+from langchain_core.chat_history import BaseChatMessageHistory
+from langchain_core.language_models.base import BaseLanguageModel
+from langchain_core.messages import BaseMessage, SystemMessage, HumanMessage, AIMessage
+from langchain_core.callbacks import CallbackManager
 
 # Streamlit and visualisation
 import streamlit as st
@@ -131,7 +139,7 @@ LOCAL_VECTOR_STORE_DIR = (
 
 st.title("Ground Hazard Dashboard")
 st.write(
-    "Let's start building! For help and inspiration, head over to [docs.streamlit.io](https://docs.streamlit.io/)."
+    "Let's understand the ground beneath our feet! "
 )
 # API keys
 st.session_state.openai_embedding_key = ""
@@ -183,12 +191,6 @@ def expander_model_parameters(
             step=0.05,
         )
 
-model_set_up = expander_model_parameters(
-    LLM_provider="OpenAI",
-    text_input_API_key="OpenAI API Key - [Get an API key](https://platform.openai.com/account/api-keys)",
-    list_models=["text-embedding-ada-002", "gpt-4o-mini"],
-)
-
 #sidebar
 
 def sidebar_and_documentChooser():
@@ -197,7 +199,7 @@ def sidebar_and_documentChooser():
 
     with st.sidebar:
         st.caption(
-            "🚀 A retrieval augmented generation chatbot powered by 🔗 Langchain, OpenAI, and Ground Engineering"
+            "🚀 A retrieval augmented generation chatbot powered by 🔗 Langchain, OpenAI, and BH Ground Engineering Expertise"
         )
         st.write("")
 
@@ -328,8 +330,8 @@ def sidebar_and_documentChooser():
                                 embeddings=embeddings_model,
                                 retriever_type=st.session_state.retriever_type,
                                 base_retriever_search_type="similarity",
-                                base_retriever_k=16,
-                                compression_retriever_k=20
+                                base_retriever_k=10,
+                                compression_retriever_k=10
 
                             )
 
@@ -354,76 +356,19 @@ def sidebar_and_documentChooser():
                             st.error(e)
         
 
-
-def plot_well_locations(result_df):
-    st.title("Well Location Finder")
-
-    input_type = st.radio("Input coordinate type:", ("Easting/Northing", "Latitude/Longitude"))
-    if input_type == "Easting/Northing":
-        x = st.number_input("Enter Easting (LOCA_NATE):", value=0.0)
-        y = st.number_input("Enter Northing (LOCA_NATN):", value=0.0)
-    else:
-        x = st.number_input("Enter Longitude:", value=0.0)
-        y = st.number_input("Enter Latitude:", value=0.0)
-
-    # Calculate Euclidean distance (assumes projected coordinates, e.g., British National Grid)
-    dists = np.sqrt((result_df['LOCA_NATE'] - x)**2 + (result_df['LOCA_NATN'] - y)**2)
-    filtered = result_df[dists <= 400]
-
-    # Prepare dataframe for mapping: treat LOCA_NATE as lon and LOCA_NATN as lat
-    map_df = result_df.dropna(subset=['LOCA_NATE', 'LOCA_NATN']).copy()
-    map_df['lon'] = map_df['LOCA_NATE']
-    map_df['lat'] = map_df['LOCA_NATN']
-
-    filtered_map = filtered.copy()
-    filtered_map['lon'] = filtered_map['LOCA_NATE']
-    filtered_map['lat'] = filtered_map['LOCA_NATN']
-
-    # Create map with all wells (light grey) and highlight filtered wells + search point
-    fig = px.scatter_map(
-        map_df,
-        lat='lat',
-        lon='lon',
-        hover_name='LOCA_ID' if 'LOCA_ID' in map_df.columns else None,
-        color_discrete_sequence=['lightgrey'],
-        zoom=10,
-        height=600,
-    )
-
-    # add filtered wells
-    fig.add_trace(go.Scattergeo(
-        lat=filtered_map['lat'],
-        lon=filtered_map['lon'],
-        mode='markers',
-        marker=dict(size=10, color='blue'),
-        name='Wells within 400m'
-    ))
-
-    # add search point
-    fig.add_trace(go.Scattergeo(
-        lat=[y],
-        lon=[x],
-        mode='markers',
-        marker=dict(size=14, color='red'),
-        name='Search point'
-    ))
-
-    fig.update_layout(
-        mapbox_style="open-street-map",
-        mapbox_center={"lat": float(y), "lon": float(x)},
-        mapbox_zoom=12,
-        title="Well Locations (map)"
-    )
-
-    st.plotly_chart(fig, use_container_width=True)
-    return filtered
-
-filtered_wells = plot_well_locations(result_df)
-
-
 ####################################################################
 #        Process documents and create vectorstor (Chroma dB)
 ####################################################################
+
+def delte_temp_files():
+    """delete files from the './data/tmp' folder"""
+    files = glob.glob(TMP_DIR.as_posix() + "/*")
+    for f in files:
+        try:
+            os.remove(f)
+        except:
+            pass
+
 
 def load_all_pdfs_from_directory(directory_path):
     pdf_paths = glob.glob(f"{directory_path}/*.pdf")
@@ -446,18 +391,15 @@ _, all_data_metadata = load_all_pdfs_from_directory(pdf_directory)
 def split_documents_to_chunks(documents):
     """Split documents to chunks using RecursiveCharacterTextSplitter."""
 
-    text_splitter = RecursiveCharacterTextSplitter(chunk_size=100, chunk_overlap=100)
+    text_splitter = RecursiveCharacterTextSplitter(separators=['\n', '.', ''], chunk_size=1000, chunk_overlap=10)
     chunks = text_splitter.split_documents(documents)
     return chunks
 
 
 def select_embeddings_model():
     """Select embeddings models: OpenAIEmbeddings ."""
-    if st.session_state.LLM_provider == "OpenAI_Embeddings":
+    if st.session_state.LLM_provider == "OpenAI":
         embeddings = OpenAIEmbeddings(api_key=st.session_state.openai_embedding_key)
-
-    if st.session_state.LLM_provider == "OpenAI_Chat":
-        embeddings = OpenAIEmbeddings(api_key=st.session_state.openai_chat_key)
 
     return embeddings
 
@@ -465,10 +407,10 @@ def select_embeddings_model():
 def create_retriever(
     vector_store,
     embeddings,
-    retriever_type="Contextual compression",
-    base_retriever_search_type="semilarity",
-    base_retriever_k=16,
-    compression_retriever_k=20
+    retriever_type="vectorstore backed retriever",
+    base_retriever_search_type="similarity",
+    base_retriever_k=10,
+    compression_retriever_k=10
 ):
     """
     create a retriever which can be a:
@@ -483,12 +425,12 @@ def create_retriever(
         vector_store: Chroma vector database.
         embeddings: OpenAIEmbeddings or GoogleGenerativeAIEmbeddings.
 
-        retriever_type (str): in [Vectorstore backed retriever,Contextual compression,Cohere reranker]. default = Cohere reranker
+        retriever_type (str): in [vectorstore backed retriever,Contextual compression]. default = [vectorstore backed retriever
 
         base_retreiver_search_type: search_type in ["similarity", "mmr", "similarity_score_threshold"], default = similarity.
-        base_retreiver_k: The most similar vectors are returned (default k = 16).
+        base_retreiver_k: The most similar vectors are returned (default k = 10).
 
-        compression_retriever_k: top k documents returned by the compression retriever, default = 20
+        compression_retriever_k: top k documents returned by the compression retriever, default = 10
 
     """
 
@@ -499,11 +441,96 @@ def create_retriever(
         score_threshold=None,
     )
 
-    if retriever_type == "Vectorstore backed retriever":
+    if retriever_type == "vectorstore backed retriever":
         return base_retriever
 
     else:
         pass
+
+def create_compression_retriever(
+    embeddings, base_retriever, chunk_size=500, k=16, similarity_threshold=None
+):
+    """Build a ContextualCompressionRetriever.
+    We wrap the the base_retriever (a Vectorstore-backed retriever) in a ContextualCompressionRetriever.
+    The compressor here is a Document Compressor Pipeline, which splits documents
+    to smaller chunks, removes redundant documents, filters the top relevant documents,
+    and reorder the documents so that the most relevant are at beginning / end of the list.
+
+    Parameters:
+        embeddings: OpenAIEmbeddings or GoogleGenerativeAIEmbeddings.
+        base_retriever: a Vectorstore-backed retriever.
+        chunk_size (int): Docs will be splitted into smaller chunks using a CharacterTextSplitter with a default chunk_size of 500.
+        k (int): top k relevant documents to the query are filtered using the EmbeddingsFilter. default =16.
+        similarity_threshold : similarity_threshold of the  EmbeddingsFilter. default =None
+    """
+
+    # 1. splitting docs into smaller chunks
+    splitter = CharacterTextSplitter(
+        chunk_size=chunk_size, chunk_overlap=0, separator=". "
+    )
+
+    # 2. removing redundant documents
+    redundant_filter = EmbeddingsRedundantFilter(embeddings=embeddings)
+
+    # 3. filtering based on relevance to the query 
+    def filter_embedding_relevant(documents, query, embeddings=embeddings, k=k, similarity_threshold=None):
+        """
+        Filter documents based on embedding similarity to the query.
+        Returns top-k most similar documents or those above a similarity threshold.
+        """
+        query_emb = embeddings.embed_query(query)
+        doc_embs = [embeddings.embed_documents([doc.page_content])[0] for doc in documents]
+        # Compute cosine similarities
+        def cosine_similarity(a, b):
+            return np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b))
+        similarities = [cosine_similarity(query_emb, doc_emb) for doc_emb in doc_embs]
+        # Filter by threshold or top-k
+        if similarity_threshold is not None:
+            filtered = [
+                doc for doc, sim in zip(documents, similarities)
+                if sim >= similarity_threshold
+            ]
+        else:
+            # Get indices of top-k similarities
+            top_k_idx = np.argsort(similarities)[-k:][::-1]
+            filtered = [documents[i] for i in top_k_idx]
+        return filtered
+
+    class CustomCompressor:
+        def __init__(self, transformers):
+            self.transformers = transformers
+
+        def compress_documents(self, documents, query, callbacks=None):
+            docs = documents
+            for transformer in self.transformers:
+                if transformer == filter_embedding_relevant:
+                    docs = transformer(docs, query, embeddings, k=k, similarity_threshold=similarity_threshold)
+                elif hasattr(transformer, "transform_documents"):
+                    docs = transformer.transform_documents(docs)
+                elif hasattr(transformer, "transform_documents_with_query"):
+                    docs = transformer.transform_documents_with_query(docs, query)
+                else:
+                    docs = transformer(docs)
+            return docs
+
+    # 4. Reorder the documents
+    reordering = LongContextReorder()
+
+    # 5. Create compressor pipeline and retriever
+    compressor = CustomCompressor(
+        transformers=[splitter, redundant_filter, filter_embedding_relevant, reordering]
+    )
+
+    class CustomContextualCompressionRetriever:
+        def __init__(self, base_retriever, compressor):
+            self.base_retriever = base_retriever
+            self.compressor = compressor
+
+        def invoke(self, query):
+            docs = self.base_retriever.invoke(query)
+            return self.compressor.compress_documents(docs, query)
+
+    return CustomContextualCompressionRetriever(base_retriever, compressor)
 
 
 def vectorstore_backed_retriever(
@@ -567,7 +594,8 @@ def chain_RAG_blocks():
         else:
             st.session_state.error_message = ""
             try:
-
+                # 1. Delete old temp files
+                delte_temp_files()
 
                 # 2. Upload selected documents to temp directory
                 if st.session_state.uploaded_file_list is not None:
@@ -584,11 +612,12 @@ def chain_RAG_blocks():
                     if error_message != "":
                         st.warning(f"Errors: {error_message}")
 
-                    # 3. Load documents with Langchain loaders
-                    documents = load_all_pdfs_from_directory(pdf_directory)
+                    # 1. load documents
+                    all_documents, all_data_metadata = load_all_pdfs_from_directory(pdf_directory)
 
                     # 4. Split documents to chunks
-                    chunks = split_documents_to_chunks(documents)
+                    chunks = split_documents_to_chunks(all_data_metadata)
+
                     # 5. Embeddings
                     embeddings = select_embeddings_model()
 
@@ -615,8 +644,8 @@ def chain_RAG_blocks():
                             embeddings=embeddings,
                             retriever_type=st.session_state.retriever_type,
                             base_retriever_search_type="similarity",
-                            base_retriever_k=16,
-                            compression_retriever_k=20
+                            base_retriever_k=10,
+                            compression_retriever_k=10
                         )
 
                         # 8. Create memory and ConversationalRetrievalChain
@@ -830,6 +859,258 @@ Language: {language}.
 """
     return template
 
+class CustomConversationSummaryBufferMemory:
+    """
+    Custom implementation of ConversationSummaryBufferMemory.
+    Maintains a running summary and recent messages, constrained by max_token_limit.
+    """
+
+    def __init__(
+        self,
+        llm: BaseLanguageModel,
+        max_token_limit: int = 1024,
+        memory_key: str = "history",
+        assistant_prefix: str = "assistant",
+        user_prefix: str = "user",
+        input_key: Optional[str] = None,
+        output_key: Optional[str] = None,
+        return_messages: bool = False,
+        chat_memory: Optional[BaseChatMessageHistory] = None,
+        moving_summary_buffer: str = "",
+        prompt: Optional[PromptTemplate] = None,
+        summary_message_cls: Type[BaseMessage] = SystemMessage,
+    ):
+        self.llm = llm
+        self.max_token_limit = max_token_limit
+        self.memory_key = memory_key
+        self.assistant_prefix = assistant_prefix
+        self.user_prefix = user_prefix
+        self.input_key = input_key
+        self.output_key = output_key
+        self.return_messages = return_messages
+        self.chat_memory = chat_memory or []
+        self.moving_summary_buffer = moving_summary_buffer
+        self.summary_message_cls = summary_message_cls
+        self.prompt = prompt or PromptTemplate(
+            input_variables=["new_lines", "summary"],
+            template=(
+                "Progressively summarize the lines of conversation provided, adding onto the previous summary returning a new summary.\n\n"
+                "EXAMPLE\n"
+                "Current summary:\nThe human asks what the AI thinks of artificial intelligence. The AI thinks artificial intelligence is a force for good.\n\n"
+                "New lines of conversation:\nHuman: Why do you think artificial intelligence is a force for good?\nAI: Because artificial intelligence will help humans reach their full potential.\n\n"
+                "New summary:\nThe human asks what the AI thinks of artificial intelligence. The AI thinks artificial intelligence is a force for good because it will help humans reach their full potential.\n"
+                "END OF EXAMPLE\n\n"
+                "Current summary:\n{summary}\n\n"
+                "New lines of conversation:\n{new_lines}\n\n"
+                "New summary:"
+            )
+        )
+        self.summary = moving_summary_buffer
+        if isinstance(self.chat_memory, list):
+            self._messages = self.chat_memory
+        else:
+            self._messages = None
+
+    def _get_messages(self) -> List[BaseMessage]:
+        if isinstance(self.chat_memory, BaseChatMessageHistory):
+            return self.chat_memory.messages
+        return self._messages
+
+    def _set_messages(self, messages: List[BaseMessage]):
+        if isinstance(self.chat_memory, BaseChatMessageHistory):
+            self.chat_memory.clear()
+            self.chat_memory.add_messages(messages)
+        else:
+            self._messages = messages
+
+    messages = property(_get_messages, _set_messages)
+
+    def _count_tokens(self, messages: List[BaseMessage]) -> int:
+        # Replace with tiktoken or model tokenizer for accuracy
+        return sum(len(m.content.split()) for m in messages)
+
+    def predict_new_summary(self, messages: List[BaseMessage], existing_summary: str) -> str:
+        new_lines = "\n".join(
+            f"{m.type.capitalize() if hasattr(m, 'type') else m.__class__.__name__}: {m.content}" for m in messages
+        )
+        prompt_str = self.prompt.format(new_lines=new_lines, summary=existing_summary)
+        response = self.llm.invoke(prompt_str)
+        return response.content if hasattr(response, "content") else response
+
+    def prune(self):
+        messages = self.messages
+        while self._count_tokens(messages) > self.max_token_limit and len(messages) > 2:
+            # Summarize the oldest two messages
+            oldest = messages[:2]
+            self.summary = self.predict_new_summary(oldest, self.summary)
+            messages = messages[2:]
+        # Optionally, keep the summary as a system message
+        if self.summary:
+            messages = [self.summary_message_cls(content=self.summary)] + messages
+        self.messages = messages
+
+    def save_context(self, inputs: Dict[str, Any], outputs: Dict[str, str]) -> None:
+        question = inputs.get(self.input_key or "question", "")
+        answer = outputs.get(self.output_key or "answer", "")
+        new_msgs = [
+            HumanMessage(content=question),
+            AIMessage(content=answer)
+        ]
+        if isinstance(self.chat_memory, BaseChatMessageHistory):
+            self.chat_memory.add_messages(new_msgs)
+        else:
+            self._messages.extend(new_msgs)
+        self.prune()
+
+    def load_memory_variables(self, inputs: Dict[str, Any]) -> Dict[str, Any]:
+        if self.return_messages:
+            return {self.memory_key: self.messages}
+        else:
+            return {
+                self.memory_key: "\n".join(
+                    f"{m.type.capitalize() if hasattr(m, 'type') else m.__class__.__name__}: {m.content}"
+                    for m in self.messages
+                )
+            }
+
+    def clear(self) -> None:
+        if isinstance(self.chat_memory, BaseChatMessageHistory):
+            self.chat_memory.clear()
+        else:
+            self._messages = []
+        self.summary = ""
+
+    @property
+    def buffer(self):
+        if self.return_messages:
+            return self.messages
+        else:
+            return "\n".join(
+                f"{m.type.capitalize() if hasattr(m, 'type') else m.__class__.__name__}: {m.content}"
+                for m in self.messages
+            )
+
+class CustomConversationBufferMemory:
+    """
+    A basic memory implementation that simply stores the conversation history as LangChain message objects.
+    """
+
+    def __init__(
+        self,
+        memory_key='chat_history',
+        input_key='question',
+        output_key='answer',
+        return_messages=True,
+        assistant_prefix='assistant',
+        user_prefix='user',
+        chat_memory=None
+    ):
+        self.memory_key = memory_key
+        self.input_key = input_key
+        self.output_key = output_key
+        self.return_messages = return_messages
+        self.assistant_prefix = assistant_prefix
+        self.user_prefix = user_prefix
+
+        self.chat_memory = chat_memory
+        if self.chat_memory is None:
+            self.chat_history = []
+        else:
+            self.chat_history = None
+
+    def save_context(self, inputs, outputs):
+        question = inputs.get(self.input_key, "")
+        answer = outputs.get(self.output_key, "")
+        if self.chat_memory is not None:
+            self.chat_memory.add_messages([
+                HumanMessage(content=question),
+                AIMessage(content=answer)
+            ])
+        else:
+            self.chat_history.append(HumanMessage(content=question))
+            self.chat_history.append(AIMessage(content=answer))
+
+    async def asave_context(self, inputs, outputs):
+        question = inputs.get(self.input_key, "")
+        answer = outputs.get(self.output_key, "")
+        if self.chat_memory is not None and hasattr(self.chat_memory, "aadd_messages"):
+            await self.chat_memory.aadd_messages([
+                HumanMessage(content=question),
+                AIMessage(content=answer)
+            ])
+        else:
+            self.save_context(inputs, outputs)
+
+    def load_memory_variables(self, inputs):
+        if self.chat_memory is not None:
+            messages = self.chat_memory.messages if hasattr(self.chat_memory, "messages") else []
+        else:
+            messages = self.chat_history
+        if self.return_messages:
+            return {self.memory_key: messages}
+        else:
+            return {
+                self.memory_key: "\n".join(
+                    [f"{type(m).__name__}: {m.content}" for m in messages]
+                )
+            }
+
+    async def aload_memory_variables(self, inputs):
+        if self.chat_memory is not None and hasattr(self.chat_memory, "aget_messages"):
+            messages = await self.chat_memory.aget_messages()
+        else:
+            messages = self.chat_history
+        if self.return_messages:
+            return {self.memory_key: messages}
+        else:
+            return {
+                self.memory_key: "\n".join(
+                    [f"{type(m).__name__}: {m.content}" for m in messages]
+                )
+            }
+
+    def clear(self):
+        if self.chat_memory is not None and hasattr(self.chat_memory, "clear"):
+            self.chat_memory.clear()
+        else:
+            self.chat_history = []
+
+    async def aclear(self):
+        if self.chat_memory is not None and hasattr(self.chat_memory, "aclear"):
+            await self.chat_memory.aclear()
+        else:
+            self.clear()
+
+    @property
+    def buffer(self):
+        if self.chat_memory is not None and hasattr(self.chat_memory, "messages"):
+            return self.chat_memory.messages
+        return self.chat_history
+
+    async def abuffer(self):
+        if self.chat_memory is not None and hasattr(self.chat_memory, "aget_messages"):
+            return await self.chat_memory.aget_messages()
+        return self.chat_history
+
+    @property
+    def buffer_as_messages(self):
+        if self.chat_memory is not None and hasattr(self.chat_memory, "messages"):
+            return self.chat_memory.messages
+        return self.chat_history
+
+    async def abuffer_as_messages(self):
+        if self.chat_memory is not None and hasattr(self.chat_memory, "aget_messages"):
+            return await self.chat_memory.aget_messages()
+        return self.chat_history
+
+    @property
+    def buffer_as_str(self):
+        messages = self.buffer
+        return "\n".join([f"{type(m).__name__}: {m.content}" for m in messages])
+
+    async def abuffer_as_str(self):
+        messages = await self.abuffer()
+        return "\n".join([f"{type(m).__name__}: {m.content}" for m in messages])
 
 def create_ConversationalRetrievalChain(
     retriever,
@@ -989,3 +1270,71 @@ def chatbot():
 
 if __name__ == "__main__":
     chatbot()
+
+
+
+
+def plot_well_locations(result_df):
+    st.title("Well Location Finder")
+
+    input_type = st.radio("Input coordinate type:", ("Easting/Northing", "Latitude/Longitude"))
+    if input_type == "Easting/Northing":
+        x = st.number_input("Enter Easting (LOCA_NATE):", value=0.0)
+        y = st.number_input("Enter Northing (LOCA_NATN):", value=0.0)
+    else:
+        x = st.number_input("Enter Longitude:", value=0.0)
+        y = st.number_input("Enter Latitude:", value=0.0)
+
+    # Calculate Euclidean distance (assumes projected coordinates, e.g., British National Grid)
+    dists = np.sqrt((result_df['LOCA_NATE'] - x)**2 + (result_df['LOCA_NATN'] - y)**2)
+    filtered = result_df[dists <= 400]
+
+    # Prepare dataframe for mapping: treat LOCA_NATE as lon and LOCA_NATN as lat
+    map_df = result_df.dropna(subset=['LOCA_NATE', 'LOCA_NATN']).copy()
+    map_df['lon'] = map_df['LOCA_NATE']
+    map_df['lat'] = map_df['LOCA_NATN']
+
+    filtered_map = filtered.copy()
+    filtered_map['lon'] = filtered_map['LOCA_NATE']
+    filtered_map['lat'] = filtered_map['LOCA_NATN']
+
+    # Create map with all wells (light grey) and highlight filtered wells + search point
+    fig = px.scatter_map(
+        map_df,
+        lat='lat',
+        lon='lon',
+        hover_name='LOCA_ID' if 'LOCA_ID' in map_df.columns else None,
+        color_discrete_sequence=['lightgrey'],
+        zoom=10,
+        height=600,
+    )
+
+    # add filtered wells
+    fig.add_trace(go.Scattergeo(
+        lat=filtered_map['lat'],
+        lon=filtered_map['lon'],
+        mode='markers',
+        marker=dict(size=10, color='blue'),
+        name='Wells within 400m'
+    ))
+
+    # add search point
+    fig.add_trace(go.Scattergeo(
+        lat=[y],
+        lon=[x],
+        mode='markers',
+        marker=dict(size=14, color='red'),
+        name='Search point'
+    ))
+
+    fig.update_layout(
+        mapbox_style="open-street-map",
+        mapbox_center={"lat": float(y), "lon": float(x)},
+        mapbox_zoom=12,
+        title="Well Locations (map)"
+    )
+
+    st.plotly_chart(fig, use_container_width=True)
+    return filtered
+
+filtered_wells = plot_well_locations(result_df)
