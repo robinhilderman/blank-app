@@ -6,8 +6,6 @@ pypdf
 streamlit
 plotly
 
-tkinter
-
 langchain
 langchain-community
 langchain-text-splitters
