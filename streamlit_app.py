@@ -2,9 +2,17 @@
 #                         import
 ####################################################################
 
+# Monkeypatch system sqlite3 to use the bundled up-to-date SQLite from pysqlite3-binary
+import sys
+try:
+    import pysqlite3 as sqlite3  # provides newer SQLite than system
+    sys.modules['sqlite3'] = sqlite3
+except Exception:
+    # fallback to system sqlite3 if pysqlite3-binary is not available
+    pass
+
 import os, glob, tiktoken
 from pathlib import Path
-
 
 import pandas as pd
 import numpy as np
@@ -20,7 +28,7 @@ import openai
 from openai import AzureOpenAI
 
 # PDF loader
-from langchain_community.document_loaders import PyPDFLoader
+from langchain_community.document_loaders import PyPDFLoader,TextLoader,DirectoryLoader,CSVLoader, UnstructuredExcelLoader, Docx2txtLoader
 
 # Embedding
 from langchain_community.embeddings import AzureOpenAIEmbeddings
@@ -108,22 +116,12 @@ list_LLM_providers = [
     ":rainbow[**OpenAI**]"]
 
 dict_welcome_message = {
-    "english": "How can I assist you today?",
-    "french": "Comment puis-je vous aider aujourd’hui ?",
-    "spanish": "¿Cómo puedo ayudarle hoy?",
-    "german": "Wie kann ich Ihnen heute helfen?",
-    "russian": "Чем я могу помочь вам сегодня?",
-    "chinese": "我今天能帮你什么？",
-    "arabic": "كيف يمكنني مساعدتك اليوم؟",
-    "portuguese": "Como posso ajudá-lo hoje?",
-    "italian": "Come posso assistervi oggi?",
-    "Japanese": "今日はどのようなご用件でしょうか?",
+    "english": "How can I assist you today?"
 }
 
 list_retriever_types = [
     "Vectorstore backed retriever",
-    "Contextual compression",
-        "Cohere reranker"
+    "Contextual compression"
     ''
 ]
 
@@ -131,7 +129,6 @@ TMP_DIR = Path(__file__).resolve().parent.joinpath("data", "tmp")
 LOCAL_VECTOR_STORE_DIR = (
     Path(__file__).resolve().parent.joinpath("data", "vector_stores")
 )
-
 
 ####################################################################
 #            Create app interface with streamlit
@@ -213,6 +210,18 @@ def sidebar_and_documentChooser():
             ],
         )
 
+        # OpenAI API Key input (visible in sidebar)
+        api_key_input = st.text_input(
+            "OpenAI API Key",
+            type="password",
+            placeholder="sk-...",
+            help="This key is used for embeddings and chat. Stored in session_state for the app."
+        )
+        if api_key_input:
+            st.session_state.openai_api_key = api_key_input
+            st.session_state.openai_chat_key = api_key_input
+            st.session_state.openai_embedding_key = api_key_input
+
         st.divider()
         if llm_chooser == list_LLM_providers[0]:
             expander_model_parameters(
@@ -276,21 +285,14 @@ def sidebar_and_documentChooser():
         st.write("Please select a Vectorstore:")
 
         clicked = st.button("Vectorstore chooser")
-        root = tk.Tk()
-        root.withdraw()
-        root.wm_attributes("-topmost", 1)  # Make dialog appear on top of other windows
-
+        # Use Streamlit UI instead of tkinter dialog (works in headless / containers)
         st.session_state.selected_vectorstore_name = ""
 
         if clicked:
             # Check inputs
             error_messages = []
-            if (
-                not st.session_state.openai_api_key
-            ):
-                error_messages.append(
-                    f"insert your {st.session_state.LLM_provider} API key"
-                )
+            if not st.session_state.openai_api_key:
+                error_messages.append(f"insert your {st.session_state.LLM_provider} API key")
 
             if len(error_messages) == 1:
                 st.session_state.error_message = "Please " + error_messages[0] + "."
@@ -304,56 +306,59 @@ def sidebar_and_documentChooser():
                     + "."
                 )
                 st.warning(st.session_state.error_message)
-
-            # if API keys are inserted, start loading Chroma index, then create retriever and ConversationalRetrievalChain
             else:
-                selected_vectorstore_path = filedialog.askdirectory(master=root)
+                # list available saved vectorstore directories
+                try:
+                    dirs = [str(p) for p in LOCAL_VECTOR_STORE_DIR.iterdir() if p.is_dir()]
+                except Exception:
+                    dirs = []
 
-                if selected_vectorstore_path == "":
-                    st.info("Please select a valid path.")
-
+                if not dirs:
+                    st.info(f"No saved vectorstores found in {LOCAL_VECTOR_STORE_DIR.as_posix()}.")
                 else:
-                    with st.spinner("Loading vectorstore..."):
-                        st.session_state.selected_vectorstore_name = (
-                            selected_vectorstore_path.split("/")[-1]
-                        )
-                        try:
-                            # 1. load Chroma vectorestore
-                            embeddings_model = select_embeddings_model()
-                            st.session_state.vector_store = Chroma(
-                                persist_directory = LOCAL_VECTOR_STORE_DIR.as_posix() + "/Vit_All_OpenAI_Embeddings",
-                                embedding_function=embeddings_model)
+                    selected_vectorstore_path = st.selectbox("Select saved Vectorstore directory", options=[""] + dirs)
+                    if selected_vectorstore_path:
+                        with st.spinner("Loading vectorstore..."):
+                            st.session_state.selected_vectorstore_name = Path(selected_vectorstore_path).name
+                            try:
+                                # 1. load Chroma vectorestore
+                                embeddings_model = select_embeddings_model()
+                                st.session_state.vector_store = Chroma(
+                                    persist_directory=selected_vectorstore_path,
+                                    embedding_function=embeddings_model,
+                                )
 
-                            # 2. create retriever
-                            st.session_state.retriever = create_retriever(
-                                vector_store=st.session_state.vector_store,
-                                embeddings=embeddings_model,
-                                retriever_type=st.session_state.retriever_type,
-                                base_retriever_search_type="similarity",
-                                base_retriever_k=10,
-                                compression_retriever_k=10
+                                # 2. create retriever
+                                st.session_state.retriever = create_retriever(
+                                    vector_store=st.session_state.vector_store,
+                                    embeddings=embeddings_model,
+                                    retriever_type=st.session_state.retriever_type,
+                                    base_retriever_search_type="similarity",
+                                    base_retriever_k=10,
+                                    compression_retriever_k=10,
+                                )
 
-                            )
+                                # 3. create memory and ConversationalRetrievalChain
+                                (
+                                    st.session_state.chain,
+                                    st.session_state.memory,
+                                ) = custom_create_ConversationalRetrievalChain(
+                                    condense_question_llm=st.session_state.condense_question_llm,
+                                    response_generation_llm=st.session_state.response_generation_llm,
+                                    retriever=st.session_state.retriever,
+                                    chain_type="stuff",
+                                    llm_provider=st.session_state.LLM_provider,
+                                    model_name=st.session_state.selected_model,
+                                    language=st.session_state.assistant_language,
+                                )
 
-                            # 3. create memory and ConversationalRetrievalChain
-                            (
-                                st.session_state.chain,
-                                st.session_state.memory,
-                            ) = create_ConversationalRetrievalChain(
-                                retriever=st.session_state.retriever,
-                                chain_type="stuff",
-                                language=st.session_state.assistant_language,
-                            )
+                                # 4. clear chat_history
+                                clear_chat_history()
 
-                            # 4. clear chat_history
-                            clear_chat_history()
+                                st.info(f"**{st.session_state.selected_vectorstore_name}** is loaded successfully.")
 
-                            st.info(
-                                f"**{st.session_state.selected_vectorstore_name}** is loaded successfully."
-                            )
-
-                        except Exception as e:
-                            st.error(e)
+                            except Exception as e:
+                                st.error(e)
         
 
 ####################################################################
@@ -369,24 +374,38 @@ def delte_temp_files():
         except:
             pass
 
+def langchain_document_loader():
+    """
+    Crete documnet loaders for PDF, TXT and CSV files.
+    https://python.langchain.com/docs/modules/data_connection/document_loaders/file_directory
+    """
 
-def load_all_pdfs_from_directory(directory_path):
-    pdf_paths = glob.glob(f"{directory_path}/*.pdf")
-    all_documents = [os.path.basename(pdf) for pdf in pdf_paths]
-    all_data_metadata = []
-    for pdf in pdf_paths:
-        loader = PyPDFLoader(file_path=pdf)
-        document = loader.load()
-        for page in document:
-            doc = Document(
-                page_content = page.page_content,
-                metadata = {"source": pdf}
-            )
-            all_data_metadata.append(doc)
-    return all_documents, all_data_metadata
+    documents = []
 
-pdf_directory = '/workspaces/blank-app/.devcontainer/data'
-_, all_data_metadata = load_all_pdfs_from_directory(pdf_directory)
+    txt_loader = DirectoryLoader(
+        TMP_DIR.as_posix(), glob="**/*.txt", loader_cls=TextLoader, show_progress=True
+    )
+    documents.extend(txt_loader.load())
+
+    pdf_loader = DirectoryLoader(
+        TMP_DIR.as_posix(), glob="**/*.pdf", loader_cls=PyPDFLoader, show_progress=True
+    )
+    documents.extend(pdf_loader.load())
+
+    csv_loader = DirectoryLoader(
+        TMP_DIR.as_posix(), glob="**/*.csv", loader_cls=CSVLoader, show_progress=True,
+        loader_kwargs={"encoding":"utf8"}
+    )
+    documents.extend(csv_loader.load())
+
+    doc_loader = DirectoryLoader(
+        TMP_DIR.as_posix(),
+        glob="**/*.docx",
+        loader_cls=Docx2txtLoader,
+        show_progress=True,
+    )
+    documents.extend(doc_loader.load())
+    return documents
 
 def split_documents_to_chunks(documents):
     """Split documents to chunks using RecursiveCharacterTextSplitter."""
@@ -395,7 +414,6 @@ def split_documents_to_chunks(documents):
     chunks = text_splitter.split_documents(documents)
     return chunks
 
-
 def select_embeddings_model():
     """Select embeddings models: OpenAIEmbeddings ."""
     if st.session_state.LLM_provider == "OpenAI":
@@ -403,14 +421,13 @@ def select_embeddings_model():
 
     return embeddings
 
-
 def create_retriever(
     vector_store,
     embeddings,
     retriever_type="vectorstore backed retriever",
     base_retriever_search_type="similarity",
-    base_retriever_k=10,
-    compression_retriever_k=10
+    base_retriever_k=4,
+    compression_retriever_k=6,
 ):
     """
     create a retriever which can be a:
@@ -428,9 +445,9 @@ def create_retriever(
         retriever_type (str): in [vectorstore backed retriever,Contextual compression]. default = [vectorstore backed retriever
 
         base_retreiver_search_type: search_type in ["similarity", "mmr", "similarity_score_threshold"], default = similarity.
-        base_retreiver_k: The most similar vectors are returned (default k = 10).
+        base_retreiver_k: The most similar vectors are returned (default k = 4).
 
-        compression_retriever_k: top k documents returned by the compression retriever, default = 10
+        compression_retriever_k: top k documents returned by the compression retriever, default = 6
 
     """
 
@@ -448,7 +465,7 @@ def create_retriever(
         pass
 
 def create_compression_retriever(
-    embeddings, base_retriever, chunk_size=500, k=16, similarity_threshold=None
+    embeddings, base_retriever, chunk_size=500, k=10, similarity_threshold=None
 ):
     """Build a ContextualCompressionRetriever.
     We wrap the the base_retriever (a Vectorstore-backed retriever) in a ContextualCompressionRetriever.
@@ -460,7 +477,7 @@ def create_compression_retriever(
         embeddings: OpenAIEmbeddings or GoogleGenerativeAIEmbeddings.
         base_retriever: a Vectorstore-backed retriever.
         chunk_size (int): Docs will be splitted into smaller chunks using a CharacterTextSplitter with a default chunk_size of 500.
-        k (int): top k relevant documents to the query are filtered using the EmbeddingsFilter. default =16.
+        k (int): top k relevant documents to the query are filtered using the EmbeddingsFilter. default =10.
         similarity_threshold : similarity_threshold of the  EmbeddingsFilter. default =None
     """
 
@@ -532,7 +549,6 @@ def create_compression_retriever(
 
     return CustomContextualCompressionRetriever(base_retriever, compressor)
 
-
 def vectorstore_backed_retriever(
     vectorstore, search_type="similarity", k=4, score_threshold=None
 ):
@@ -554,7 +570,6 @@ def vectorstore_backed_retriever(
     )
     return retriever
 
-
 def chain_RAG_blocks():
     """The RAG system is composed of:
     - 1. Retrieval: includes document loaders, text splitter, vectorstore and retriever.
@@ -570,12 +585,6 @@ def chain_RAG_blocks():
             error_messages.append(
                 f"insert your {st.session_state.LLM_provider} API key"
             )
-
-        if (
-            st.session_state.retriever_type == list_retriever_types[0]
-            and not st.session_state.cohere_api_key
-        ):
-            error_messages.append(f"insert your Cohere API key")
         if not st.session_state.uploaded_file_list:
             error_messages.append("select documents to upload")
         if st.session_state.vector_store_name == "":
@@ -599,35 +608,33 @@ def chain_RAG_blocks():
 
                 # 2. Upload selected documents to temp directory
                 if st.session_state.uploaded_file_list is not None:
+                    # Ensure tmp dir exists
+                    TMP_DIR.mkdir(parents=True, exist_ok=True)
+                    upload_errors: List[str] = []
                     for uploaded_file in st.session_state.uploaded_file_list:
-                        error_message = ""
                         try:
-                            temp_file_path = os.path.join(
-                                TMP_DIR.as_posix(), uploaded_file.name
-                            )
+                            temp_file_path = os.path.join(TMP_DIR.as_posix(), uploaded_file.name)
                             with open(temp_file_path, "wb") as temp_file:
                                 temp_file.write(uploaded_file.read())
                         except Exception as e:
-                            error_message += e
-                    if error_message != "":
-                        st.warning(f"Errors: {error_message}")
-
-                    # 1. load documents
-                    all_documents, all_data_metadata = load_all_pdfs_from_directory(pdf_directory)
-
-                    # 4. Split documents to chunks
-                    chunks = split_documents_to_chunks(all_data_metadata)
-
-                    # 5. Embeddings
+                            upload_errors.append(str(e))
+                    if upload_errors:
+                        st.warning("Errors saving uploaded files: " + "; ".join(upload_errors))
+ 
+                     # 3. Load documents with Langchain loaders
+                    documents = langchain_document_loader()
+ 
+                     # 4. Split documents to chunks
+                    chunks = split_documents_to_chunks(documents)
+ 
+                     # 5. Embeddings
                     embeddings = select_embeddings_model()
-
-                    # 6. Create a vectorstore
+ 
+                     # 6. Create a vectorstore
                     persist_directory = (
-                        LOCAL_VECTOR_STORE_DIR.as_posix()
-                        + "/"
-                        + st.session_state.vector_store_name
+                        LOCAL_VECTOR_STORE_DIR.as_posix() + "/" + st.session_state.vector_store_name
                     )
-
+ 
                     try:
                         st.session_state.vector_store = Chroma.from_documents(
                             documents=chunks,
@@ -645,20 +652,24 @@ def chain_RAG_blocks():
                             retriever_type=st.session_state.retriever_type,
                             base_retriever_search_type="similarity",
                             base_retriever_k=10,
-                            compression_retriever_k=10
+                            compression_retriever_k=10,
                         )
 
                         # 8. Create memory and ConversationalRetrievalChain
                         (
                             st.session_state.chain,
                             st.session_state.memory,
-                        ) = create_ConversationalRetrievalChain(
+                        ) = custom_create_ConversationalRetrievalChain(
+                            condense_question_llm = st.session_state.condense_question_llm,
+                            response_generation_llm = st.session_state.response_generation_llm,
                             retriever=st.session_state.retriever,
                             chain_type="stuff",
+                            llm_provider = st.session_state.LLM_provider,
+                            model_name=st.session_state.selected_model,
                             language=st.session_state.assistant_language,
                         )
 
-                        # 9. Cclear chat_history
+                        # 9. Clear chat_history
                         clear_chat_history()
 
                     except Exception as e:
@@ -836,7 +847,7 @@ def create_memory(model_name='gpt-4o-mini', memory_max_token=None):
 
 
 ####################################################################
-#          Create ConversationalRetrievalChain with memory
+#          Create Custom ConversationalRetrievalChain with memory
 ####################################################################
 
 
@@ -859,264 +870,22 @@ Language: {language}.
 """
     return template
 
-class CustomConversationSummaryBufferMemory:
-    """
-    Custom implementation of ConversationSummaryBufferMemory.
-    Maintains a running summary and recent messages, constrained by max_token_limit.
-    """
+def format_docs(doc, document_prompt):
+    return document_prompt.format(page_content=doc.page_content)
+    
+def _combine_documents(docs, document_prompt, document_separator="\n\n"):
+    doc_strings = [format_docs(doc, document_prompt) for doc in docs]
+    return document_separator.join(doc_strings)
 
-    def __init__(
-        self,
-        llm: BaseLanguageModel,
-        max_token_limit: int = 1024,
-        memory_key: str = "history",
-        assistant_prefix: str = "assistant",
-        user_prefix: str = "user",
-        input_key: Optional[str] = None,
-        output_key: Optional[str] = None,
-        return_messages: bool = False,
-        chat_memory: Optional[BaseChatMessageHistory] = None,
-        moving_summary_buffer: str = "",
-        prompt: Optional[PromptTemplate] = None,
-        summary_message_cls: Type[BaseMessage] = SystemMessage,
-    ):
-        self.llm = llm
-        self.max_token_limit = max_token_limit
-        self.memory_key = memory_key
-        self.assistant_prefix = assistant_prefix
-        self.user_prefix = user_prefix
-        self.input_key = input_key
-        self.output_key = output_key
-        self.return_messages = return_messages
-        self.chat_memory = chat_memory or []
-        self.moving_summary_buffer = moving_summary_buffer
-        self.summary_message_cls = summary_message_cls
-        self.prompt = prompt or PromptTemplate(
-            input_variables=["new_lines", "summary"],
-            template=(
-                "Progressively summarize the lines of conversation provided, adding onto the previous summary returning a new summary.\n\n"
-                "EXAMPLE\n"
-                "Current summary:\nThe human asks what the AI thinks of artificial intelligence. The AI thinks artificial intelligence is a force for good.\n\n"
-                "New lines of conversation:\nHuman: Why do you think artificial intelligence is a force for good?\nAI: Because artificial intelligence will help humans reach their full potential.\n\n"
-                "New summary:\nThe human asks what the AI thinks of artificial intelligence. The AI thinks artificial intelligence is a force for good because it will help humans reach their full potential.\n"
-                "END OF EXAMPLE\n\n"
-                "Current summary:\n{summary}\n\n"
-                "New lines of conversation:\n{new_lines}\n\n"
-                "New summary:"
-            )
-        )
-        self.summary = moving_summary_buffer
-        if isinstance(self.chat_memory, list):
-            self._messages = self.chat_memory
-        else:
-            self._messages = None
-
-    def _get_messages(self) -> List[BaseMessage]:
-        if isinstance(self.chat_memory, BaseChatMessageHistory):
-            return self.chat_memory.messages
-        return self._messages
-
-    def _set_messages(self, messages: List[BaseMessage]):
-        if isinstance(self.chat_memory, BaseChatMessageHistory):
-            self.chat_memory.clear()
-            self.chat_memory.add_messages(messages)
-        else:
-            self._messages = messages
-
-    messages = property(_get_messages, _set_messages)
-
-    def _count_tokens(self, messages: List[BaseMessage]) -> int:
-        # Replace with tiktoken or model tokenizer for accuracy
-        return sum(len(m.content.split()) for m in messages)
-
-    def predict_new_summary(self, messages: List[BaseMessage], existing_summary: str) -> str:
-        new_lines = "\n".join(
-            f"{m.type.capitalize() if hasattr(m, 'type') else m.__class__.__name__}: {m.content}" for m in messages
-        )
-        prompt_str = self.prompt.format(new_lines=new_lines, summary=existing_summary)
-        response = self.llm.invoke(prompt_str)
-        return response.content if hasattr(response, "content") else response
-
-    def prune(self):
-        messages = self.messages
-        while self._count_tokens(messages) > self.max_token_limit and len(messages) > 2:
-            # Summarize the oldest two messages
-            oldest = messages[:2]
-            self.summary = self.predict_new_summary(oldest, self.summary)
-            messages = messages[2:]
-        # Optionally, keep the summary as a system message
-        if self.summary:
-            messages = [self.summary_message_cls(content=self.summary)] + messages
-        self.messages = messages
-
-    def save_context(self, inputs: Dict[str, Any], outputs: Dict[str, str]) -> None:
-        question = inputs.get(self.input_key or "question", "")
-        answer = outputs.get(self.output_key or "answer", "")
-        new_msgs = [
-            HumanMessage(content=question),
-            AIMessage(content=answer)
-        ]
-        if isinstance(self.chat_memory, BaseChatMessageHistory):
-            self.chat_memory.add_messages(new_msgs)
-        else:
-            self._messages.extend(new_msgs)
-        self.prune()
-
-    def load_memory_variables(self, inputs: Dict[str, Any]) -> Dict[str, Any]:
-        if self.return_messages:
-            return {self.memory_key: self.messages}
-        else:
-            return {
-                self.memory_key: "\n".join(
-                    f"{m.type.capitalize() if hasattr(m, 'type') else m.__class__.__name__}: {m.content}"
-                    for m in self.messages
-                )
-            }
-
-    def clear(self) -> None:
-        if isinstance(self.chat_memory, BaseChatMessageHistory):
-            self.chat_memory.clear()
-        else:
-            self._messages = []
-        self.summary = ""
-
-    @property
-    def buffer(self):
-        if self.return_messages:
-            return self.messages
-        else:
-            return "\n".join(
-                f"{m.type.capitalize() if hasattr(m, 'type') else m.__class__.__name__}: {m.content}"
-                for m in self.messages
-            )
-
-class CustomConversationBufferMemory:
-    """
-    A basic memory implementation that simply stores the conversation history as LangChain message objects.
-    """
-
-    def __init__(
-        self,
-        memory_key='chat_history',
-        input_key='question',
-        output_key='answer',
-        return_messages=True,
-        assistant_prefix='assistant',
-        user_prefix='user',
-        chat_memory=None
-    ):
-        self.memory_key = memory_key
-        self.input_key = input_key
-        self.output_key = output_key
-        self.return_messages = return_messages
-        self.assistant_prefix = assistant_prefix
-        self.user_prefix = user_prefix
-
-        self.chat_memory = chat_memory
-        if self.chat_memory is None:
-            self.chat_history = []
-        else:
-            self.chat_history = None
-
-    def save_context(self, inputs, outputs):
-        question = inputs.get(self.input_key, "")
-        answer = outputs.get(self.output_key, "")
-        if self.chat_memory is not None:
-            self.chat_memory.add_messages([
-                HumanMessage(content=question),
-                AIMessage(content=answer)
-            ])
-        else:
-            self.chat_history.append(HumanMessage(content=question))
-            self.chat_history.append(AIMessage(content=answer))
-
-    async def asave_context(self, inputs, outputs):
-        question = inputs.get(self.input_key, "")
-        answer = outputs.get(self.output_key, "")
-        if self.chat_memory is not None and hasattr(self.chat_memory, "aadd_messages"):
-            await self.chat_memory.aadd_messages([
-                HumanMessage(content=question),
-                AIMessage(content=answer)
-            ])
-        else:
-            self.save_context(inputs, outputs)
-
-    def load_memory_variables(self, inputs):
-        if self.chat_memory is not None:
-            messages = self.chat_memory.messages if hasattr(self.chat_memory, "messages") else []
-        else:
-            messages = self.chat_history
-        if self.return_messages:
-            return {self.memory_key: messages}
-        else:
-            return {
-                self.memory_key: "\n".join(
-                    [f"{type(m).__name__}: {m.content}" for m in messages]
-                )
-            }
-
-    async def aload_memory_variables(self, inputs):
-        if self.chat_memory is not None and hasattr(self.chat_memory, "aget_messages"):
-            messages = await self.chat_memory.aget_messages()
-        else:
-            messages = self.chat_history
-        if self.return_messages:
-            return {self.memory_key: messages}
-        else:
-            return {
-                self.memory_key: "\n".join(
-                    [f"{type(m).__name__}: {m.content}" for m in messages]
-                )
-            }
-
-    def clear(self):
-        if self.chat_memory is not None and hasattr(self.chat_memory, "clear"):
-            self.chat_memory.clear()
-        else:
-            self.chat_history = []
-
-    async def aclear(self):
-        if self.chat_memory is not None and hasattr(self.chat_memory, "aclear"):
-            await self.chat_memory.aclear()
-        else:
-            self.clear()
-
-    @property
-    def buffer(self):
-        if self.chat_memory is not None and hasattr(self.chat_memory, "messages"):
-            return self.chat_memory.messages
-        return self.chat_history
-
-    async def abuffer(self):
-        if self.chat_memory is not None and hasattr(self.chat_memory, "aget_messages"):
-            return await self.chat_memory.aget_messages()
-        return self.chat_history
-
-    @property
-    def buffer_as_messages(self):
-        if self.chat_memory is not None and hasattr(self.chat_memory, "messages"):
-            return self.chat_memory.messages
-        return self.chat_history
-
-    async def abuffer_as_messages(self):
-        if self.chat_memory is not None and hasattr(self.chat_memory, "aget_messages"):
-            return await self.chat_memory.aget_messages()
-        return self.chat_history
-
-    @property
-    def buffer_as_str(self):
-        messages = self.buffer
-        return "\n".join([f"{type(m).__name__}: {m.content}" for m in messages])
-
-    async def abuffer_as_str(self):
-        messages = await self.abuffer()
-        return "\n".join([f"{type(m).__name__}: {m.content}" for m in messages])
-
-def create_ConversationalRetrievalChain(
+def custom_create_ConversationalRetrievalChain(
+    condense_question_llm, 
+    response_generation_llm,
     retriever,
-    chain_type="stuff",
     language="english",
-):
+    chain_type="stuff",
+    llm_provider="OpenAI",
+    model_name='gpt-4o-mini',
+): 
     """Create a ConversationalRetrievalChain.
     First, it passes the follow-up question along with the chat history to an LLM which rephrases
     the question and generates a standalone query.
@@ -1124,10 +893,19 @@ def create_ConversationalRetrievalChain(
     and passes them along with the standalone question and chat history to an LLM to answer.
     """
 
-    # 1. Define the standalone_question prompt.
-    # Pass the follow-up question along with the chat history to the `condense_question_llm`
-    # which rephrases the question and generates a standalone question.
+    ##############################################################
+    # Step 1: Create a standalone_question chain
+    ##############################################################
+    
+    # 1.Create memory: ConversationSummaryBufferMemory for gpt-4o-mini, and ConversationBufferMemory for the other models
+    memory = create_memory(st.session_state.selected_model)
 
+    #2. load memory using RunnableLambda. Retrieves the chat_history attribute using itemgetter.
+    loaded_memory = RunnablePassthrough.assign(
+        chat_history=RunnableLambda(memory.load_memory_variables) | itemgetter("chat_history"),
+    )
+
+    # 3. Pass the follow-up question along with the chat history to the LLM, and parse the answer (standalone_question).
     condense_question_prompt = PromptTemplate(
         input_variables=["chat_history", "question"],
         template="""Given the following conversation and a follow up question, 
@@ -1135,24 +913,16 @@ rephrase the follow up question to be a standalone question, in its original lan
 Chat History:\n{chat_history}\n
 Follow Up Input: {question}\n
 Standalone question:""",
-    )
+    )   
 
-    # 2. Define the answer_prompt
-    # Pass the standalone question + the chat history + the context (retrieved documents)
-    # to the `LLM` wihch will answer
-
-    answer_prompt = ChatPromptTemplate.from_template(answer_template(language=language))
-
-    # 3. Add ConversationSummaryBufferMemory for gpt-3.5, and ConversationBufferMemory for the other models
-    memory = create_memory(st.session_state.selected_model)
-
-    # 4. Instantiate LLMs: standalone_query_generation_llm & response_generation_llm
+    # 4. Instantiate LLMs: condense_question_llm & response_generation_llm
     if st.session_state.LLM_provider == "OpenAI":
-        standalone_query_generation_llm = ChatOpenAI(
+        condense_question_llm = ChatOpenAI(
             api_key=st.session_state.openai_api_key,
             model=st.session_state.selected_model,
             temperature=0.1,
         )
+
         response_generation_llm = ChatOpenAI(
             api_key=st.session_state.openai_api_key,
             model=st.session_state.selected_model,
@@ -1160,21 +930,59 @@ Standalone question:""",
             model_kwargs={"top_p": st.session_state.top_p},
         )
 
-    # 5. Create the ConversationalRetrievalChain
+    standalone_question_chain = {
+        "standalone_question": {
+            "question": lambda x: x["question"],
+            "chat_history": lambda x: get_buffer_string(x["chat_history"]),
+        }
+        | condense_question_prompt
+        | condense_question_llm
+        | StrOutputParser(),
+    }
+    
+    # 5. Combine load_memory and standalone_question_chain
+    chain_question = loaded_memory | standalone_question_chain
+    
+    ####################################################################################
+    #   Step 2: Retrieve documents, pass them to the LLM, and return the response.
+    ####################################################################################
 
-    chain = ConversationalRetrievalChain.from_llm(
-        condense_question_prompt=condense_question_prompt,
-        combine_docs_chain_kwargs={"prompt": answer_prompt},
-        condense_question_llm=standalone_query_generation_llm,
-        llm=response_generation_llm,
-        memory=memory,
-        retriever=retriever,
-        chain_type=chain_type,
-        verbose=False,
-        return_source_documents=True,
-    )
+    # 6.Create retriever 
+    retriever = st.session_state.retriever
 
-    return chain, memory
+    # 7. Retrieve relevant documents
+    retrieved_documents = {
+        "docs": itemgetter("standalone_question") | retriever,
+        "question": lambda x: x["standalone_question"],
+    }
+    
+    # 8. Get variables ['chat_history', 'context', 'question'] that will be passed to `answer_prompt`
+    
+    DEFAULT_DOCUMENT_PROMPT = PromptTemplate.from_template(template="{page_content}")
+    answer_prompt = ChatPromptTemplate.from_template(answer_template(language=language)) 
+
+    answer_prompt_variables = {
+        "context": lambda x: _combine_documents(docs=x["docs"],document_prompt=DEFAULT_DOCUMENT_PROMPT),
+        "question": itemgetter("question"),
+        "chat_history": itemgetter("chat_history") # get it from `loaded_memory` variable
+    }
+
+    # 9. Load memory, format `answer_prompt` with variables (context, question and chat_history) and pass the `answer_prompt to LLM.
+    # return answer, docs and standalone_question
+    
+    chain_answer = {
+        "answer": loaded_memory | answer_prompt_variables | answer_prompt | response_generation_llm,
+        # return only page_content and metadata 
+        "docs": lambda x: [Document(page_content=doc.page_content,metadata=doc.metadata) for doc in x["docs"]],
+        "standalone_question": lambda x:x["question"] # return standalone_question
+    }
+
+    # 10. Final chain
+    chain = chain_question | retrieved_documents | chain_answer
+
+    print("Conversational retriever chain created successfully!")
+
+    return chain, memory 
 
 def clear_chat_history():
     """clear chat history and memory."""
@@ -1197,9 +1005,6 @@ def get_response_from_LLM(prompt):
         # 1. Invoke LLM
         response = st.session_state.chain.invoke({"question": prompt})
         answer = response["answer"]
-
-        if st.session_state.LLM_provider == "HuggingFace":
-            answer = answer[answer.find("\nAnswer: ") + len("\nAnswer: ") :]
 
         # 2. Display results
         st.session_state.messages.append({"role": "user", "content": prompt})
@@ -1230,8 +1035,6 @@ def get_response_from_LLM(prompt):
     except Exception as e:
         st.warning(e)
 
-
-
 ####################################################################
 #                         Chatbot
 ####################################################################
@@ -1257,8 +1060,6 @@ def chatbot():
     if prompt := st.chat_input():
         if (
             not st.session_state.openai_api_key
-            and not st.session_state.google_api_key
-            and not st.session_state.hf_api_key
         ):
             st.info(
                 f"Please insert your {st.session_state.LLM_provider} API key to continue."
@@ -1267,12 +1068,8 @@ def chatbot():
         with st.spinner("Running..."):
             get_response_from_LLM(prompt=prompt)
 
-
 if __name__ == "__main__":
     chatbot()
-
-
-
 
 def plot_well_locations(result_df):
     st.title("Well Location Finder")
