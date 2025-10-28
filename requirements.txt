@@ -1,11 +1,15 @@
+# Core
 numpy
 pandas
-tiktoken
+
+# PDF / document handling
 pypdf
 
+# Streamlit + plotting
 streamlit
 plotly
 
+# LangChain and related packages (match what your code imports)
 langchain
 langchain-community
 langchain-text-splitters
@@ -13,12 +17,14 @@ langchain-core
 langchain-openai
 langchain-chroma
 
+# OpenAI
 openai
-opentelemetry-exporter-otlp
+tiktoken
 
+# Chroma/SQLite helper (needed earlier)
+pysqlite3-binary
+
+# Misc
 python-ags4
-
 ipython
-
-pathlib
-
+opentelemetry-exporter-otlp
